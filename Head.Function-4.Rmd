@@ -1,0 +1,1687 @@
+---
+title: "Head.Function-4"
+author: "Divyansh Bagla"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+Import all tables
+```{r import}
+library(readxl)
+
+path <- "/Users/divyanshbagla/Desktop/STAT341/Architecture/Truss.xlsx"
+na_codes <- c("", "-", "\u2013", "\u2014", "\u2212")
+
+sheet_names <- excel_sheets(path)
+truss <- lapply(sheet_names, function(s)
+  read_excel(path, sheet = s, na = na_codes, guess_max = 100000,
+             .name_repair = if (s == "aisc") "minimal" else "unique")
+)
+names(truss) <- sheet_names
+
+# ---- aisc: trim, clean headers, drop notes rows, keep needed columns ----
+needed <- c("Type", "EDI_Std_Nomenclature", "AISC_Manual_Label",
+            "W", "A", "J", "H", "t", "tf", "ro", "rx", "ry",
+            "b/tdes", "h/tdes", "D/t", "bf/2tf", "b/t", "h/tw",
+            "B", "Ht", "tdes", "OD","Zx","Sx","Ix","Iy","rts",
+            "ho","d","Cw")
+
+a <- truss$aisc[, 1:84]
+names(a) <- gsub("[[:space:]]+", "_", trimws(names(a)))
+a <- a[!is.na(a$Type), ]
+
+missing <- setdiff(needed, names(a))
+if (length(missing)) {
+  print(names(a))
+  stop("aisc is missing: ", paste(missing, collapse = ", "))
+}
+a <- a[, needed]
+for (col in needed[-(1:3)]) a[[col]] <- as.numeric(a[[col]])
+truss$aisc <- a
+rm(a)
+
+names(truss)
+```
+
+Populate tables (aisc, bar). Creates: aisc columns (t_net, array_name_column, r_min), Bar columns (Length, cos, sin, crossing columns, L_b, EffectiveLength)
+```{r populate}
+populate_tables <- function(truss) {
+
+  populate_aisc <- function() {
+
+    rename_hss <- function() {
+      n_X <- lengths(regmatches(truss$aisc$EDI_Std_Nomenclature,
+                                gregexpr("X", truss$aisc$EDI_Std_Nomenclature)))
+      truss$aisc$Type[truss$aisc$Type == "HSS" & n_X == 2] <<- "Rectangle"
+      truss$aisc$Type[truss$aisc$Type == "HSS" & n_X == 1] <<- "Round"
+    }
+
+    # database says "W", the Family table says "WShape"
+    rename_w <- function() {
+      if ("WShape" %in% truss$Family$FamilyName)
+        truss$aisc$Type[truss$aisc$Type == "W"] <<- "WShape"
+    }
+
+    map_J <- function() {
+      truss$aisc$EDI_Std_Nomenclature_mapL <<- sub("^2(?=L)", "", truss$aisc$EDI_Std_Nomenclature, perl = TRUE)
+      truss$aisc$EDI_Std_Nomenclature_mapL <<- sub("^([^X]*X[^X]*X[^X]*)X.*$", "\\1",
+                                                   truss$aisc$EDI_Std_Nomenclature_mapL)
+      truss$aisc$EDI_Std_Nomenclature_mapL <<- sub("[^0-9]+$", "", truss$aisc$EDI_Std_Nomenclature_mapL)
+
+      pos_2L <- which(truss$aisc$Type == "2L")
+      pos_L  <- which(truss$aisc$Type == "L")
+      idx <- match(truss$aisc$EDI_Std_Nomenclature_mapL[pos_2L],
+                   truss$aisc$EDI_Std_Nomenclature[pos_L])
+      hit <- !is.na(idx)
+
+      truss$aisc$J[pos_2L[hit]] <<- 2 * truss$aisc$J[pos_L[idx[hit]]]
+    }
+
+    drop_types <- function() {
+      discard <- c("L", "M", "S", "HP", "C", "MC", "MT", "ST")
+      truss$aisc <<- truss$aisc[!truss$aisc$Type %in% discard, ]
+    }
+
+    add_columns <- function() {
+      truss$aisc$t_net <<- NA
+      truss$aisc$CostLevel1 <<- NA
+      truss$aisc$CostLevel2 <<- NA
+      truss$aisc$Fu <<- NA
+      truss$aisc$Fy <<- NA
+      truss$aisc$array_name_column <<- paste0(truss$aisc$Type, "--", truss$aisc$EDI_Std_Nomenclature)
+      truss$aisc$r_min <<- pmin(truss$aisc$rx, truss$aisc$ry)
+      truss$aisc$Limiting_ratio <<- NA
+      for (col in c("Zx", "Sx", "Ix", "Iy", "J", "rts", "ho", "d", "Cw")) {
+        truss$aisc[[col]] <<- suppressWarnings(as.numeric(truss$aisc[[col]]))
+      }
+    }
+    
+    drop_incomplete <- function() {
+    
+      # columns every section needs, whatever its type
+      core <- c("A", "W", "rx", "ry", "r_min", "Zx", "Sx", "Ix")
+      bad <- !complete.cases(truss$aisc[, core])
+    
+      # open shapes also need the lateral-torsional buckling properties
+      ltb <- c("Iy", "J", "d")
+      open <- truss$aisc$Type %in% c("WT", "2L", "WShape", "W")
+      bad <- bad | (open & !complete.cases(truss$aisc[, ltb]))
+    
+      # W shapes need two more for Chapter F2
+      isW <- truss$aisc$Type %in% c("WShape", "W")
+      bad <- bad | (isW & !complete.cases(truss$aisc[, c("rts", "ho")]))
+    
+      if (any(bad)) {
+    
+        message("drop_incomplete: removing ", sum(bad),
+                " sections with missing values:")
+    
+        print(truss$aisc[bad, c("Type", "EDI_Std_Nomenclature", core)])
+      }
+    
+      truss$aisc <<- truss$aisc[!bad, ]
+    }
+
+    add_t_net <- function() {
+      for (i in 1:nrow(truss$aisc)) {
+        type <- truss$aisc$Type[i]
+
+        if (type == "2L") {
+          truss$aisc$t_net[i] <<- truss$aisc$t[i]          # angle leg
+        } else if (type %in% c("WT", "WShape", "W")) {
+          truss$aisc$t_net[i] <<- truss$aisc$tf[i]         # flange
+        } else if (type %in% c("Rectangle", "Round", "PIPE")) {
+          truss$aisc$t_net[i] <<- 0                        # welded, no holes
+        }
+      }
+    }
+
+   Limiting_ratio_function <- function() {
+
+  # create the new column up front so indexed assignment works
+  truss$aisc$Limiting_ratio_p <<- NA_real_
+
+  for (i in 1:nrow(truss$aisc)) {
+
+    type <- truss$aisc$Type[i]
+    E    <- truss$Single_value_constant$E
+    Fy   <- truss$Family$Fy[match(type, truss$Family$FamilyName)]
+
+    if (type == "Rectangle") {
+      lr <- 1.40 * sqrt(E / Fy)
+      truss$aisc$Limiting_ratio[i] <<- max(truss$aisc$`b/tdes`[i] / lr,
+                                           truss$aisc$`h/tdes`[i] / lr) - 1
+
+      lp_flange <- 1.12 * sqrt(E / Fy)
+      lp_web    <- 2.42 * sqrt(E / Fy)
+      truss$aisc$Limiting_ratio_p[i] <<- max(truss$aisc$`b/tdes`[i] / lp_flange,
+                                             truss$aisc$`h/tdes`[i] / lp_web) - 1
+
+    } else if (type %in% c("Round", "PIPE")) {
+      lr <- 0.11 * E / Fy
+      truss$aisc$Limiting_ratio[i] <<- truss$aisc$`D/t`[i] / lr - 1
+
+      lp <- 0.07 * E / Fy
+      truss$aisc$Limiting_ratio_p[i] <<- truss$aisc$`D/t`[i] / lp - 1
+
+    } else if (type == "WT") {
+      lr_flange <- 0.56 * sqrt(E / Fy)
+      lr_stem   <- 0.75 * sqrt(E / Fy)
+      truss$aisc$Limiting_ratio[i] <<- max(truss$aisc$`bf/2tf`[i] / lr_flange,
+                                           truss$aisc$`D/t`[i]    / lr_stem) - 1
+
+      lp_flange <- 0.38 * sqrt(E / Fy)
+      lp_stem   <- 0.84 * sqrt(E / Fy)
+      truss$aisc$Limiting_ratio_p[i] <<- max(truss$aisc$`bf/2tf`[i] / lp_flange,
+                                             truss$aisc$`D/t`[i]    / lp_stem) - 1
+
+    } else if (type == "2L") {
+      lr <- 0.45 * sqrt(E / Fy)
+      truss$aisc$Limiting_ratio[i] <<- truss$aisc$`b/t`[i] / lr - 1
+
+      lp <- 0.54 * sqrt(E / Fy)
+      truss$aisc$Limiting_ratio_p[i] <<- truss$aisc$`b/t`[i] / lp - 1
+
+    } else if (type %in% c("WShape", "W")) {
+      lr_flange <- 0.56 * sqrt(E / Fy)
+      lr_web    <- 1.49 * sqrt(E / Fy)
+      truss$aisc$Limiting_ratio[i] <<- max(truss$aisc$`bf/2tf`[i] / lr_flange,
+                                           truss$aisc$`h/tw`[i]   / lr_web) - 1
+
+      lp_flange <- 0.38 * sqrt(E / Fy)
+      lp_web    <- 3.76 * sqrt(E / Fy)
+      truss$aisc$Limiting_ratio_p[i] <<- max(truss$aisc$`bf/2tf`[i] / lp_flange,
+                                             truss$aisc$`h/tw`[i]   / lp_web) - 1
+    }
+  }
+
+  truss$aisc$Limiting_ratio_test   <<- truss$aisc$Limiting_ratio   <= 0
+  truss$aisc$Limiting_ratio_p_test <<- truss$aisc$Limiting_ratio_p <= 0
+   }
+   
+
+    drop_failed_ratio <- function() {
+      keep <- truss$aisc$Limiting_ratio_test %in% TRUE     # NA counts as failed
+
+      truss$dropped_aisc_Limiting_ratio <<- truss$aisc[!keep, ]
+      truss$aisc                        <<- truss$aisc[keep, ]
+    }
+    
+    # CostLevel1: one value per family, copied to every section of that family
+    map_cost_level1 <- function() {
+      truss$aisc$CostLevel1 <<- as.numeric(
+        truss$Family$CostLevel1[match(truss$aisc$Type, truss$Family$FamilyName)]
+      )
+
+      miss <- is.na(truss$aisc$CostLevel1)
+      if (any(miss))
+        message("map_cost_level1: no cost for types: ",
+                paste(unique(truss$aisc$Type[miss]), collapse = ", "))
+    }
+
+    rename_hss()
+    rename_w()
+    map_J()
+    drop_types()
+    add_columns()
+    drop_incomplete()
+    add_t_net()
+    Limiting_ratio_function()
+    drop_failed_ratio()
+    map_cost_level1()
+  }
+
+  populate_bar <- function() {
+
+    # drop the notes rows, make bar number numeric, create empty result columns
+    clean_bar <- function() {
+      truss$Bar   <<- truss$Bar[!is.na(truss$Bar$FromJoint), ]
+      truss$Joint <<- truss$Joint[!is.na(truss$Joint$JointNumber), ]
+      truss$Bar[["Bar Number"]] <<- as.numeric(truss$Bar[["Bar Number"]])
+
+      n <- nrow(truss$Bar)
+      for (col in c("Length", "cos", "sin", "CrossingWith", "CrossingPoint_x",
+                    "CrossingPoint_y", "L1", "L2", "L_b", "EffectiveLength"))
+        truss$Bar[[col]] <<- rep(NA_real_, n)
+    }
+
+    bar_length <- function() {
+      for (i in 1:nrow(truss$Bar)) {
+        a <- which(truss$Joint$JointNumber == truss$Bar$FromJoint[i])
+        b <- which(truss$Joint$JointNumber == truss$Bar$ToJoint[i])
+        dx <- truss$Joint$x_coordinate[b] - truss$Joint$x_coordinate[a]
+        dy <- truss$Joint$y_coordinate[b] - truss$Joint$y_coordinate[a]
+
+        truss$Bar$Length[i] <<- sqrt(dx^2 + dy^2)
+        truss$Bar$cos[i]    <<- dx / truss$Bar$Length[i]
+        truss$Bar$sin[i]    <<- dy / truss$Bar$Length[i]
+      }
+    }
+
+    L_crossing_length <- function() {
+      diag <- which(truss$Bar$Type == "Diagonal")
+
+      for (i in diag) {
+        for (j in diag) {
+          if (i == j) next
+
+          a <- which(truss$Joint$JointNumber == truss$Bar$FromJoint[i])
+          b <- which(truss$Joint$JointNumber == truss$Bar$ToJoint[i])
+          px <- truss$Joint$x_coordinate[a]
+          py <- truss$Joint$y_coordinate[a]
+          rx <- truss$Joint$x_coordinate[b] - px
+          ry <- truss$Joint$y_coordinate[b] - py
+
+          k <- which(truss$Joint$JointNumber == truss$Bar$FromJoint[j])
+          m <- which(truss$Joint$JointNumber == truss$Bar$ToJoint[j])
+          qx <- truss$Joint$x_coordinate[k]
+          qy <- truss$Joint$y_coordinate[k]
+          sx <- truss$Joint$x_coordinate[m] - qx
+          sy <- truss$Joint$y_coordinate[m] - qy
+
+          d <- rx * sy - ry * sx
+          if (d == 0) next
+
+          t <- ((qx - px) * sy - (qy - py) * sx) / d
+          u <- ((qx - px) * ry - (qy - py) * rx) / d
+
+          if (t > 0 & t < 1 & u > 0 & u < 1) {
+            truss$Bar$CrossingWith[i]    <<- truss$Bar[["Bar Number"]][j]
+            truss$Bar$CrossingPoint_x[i] <<- px + t * rx
+            truss$Bar$CrossingPoint_y[i] <<- py + t * ry
+            truss$Bar$L1[i]  <<- t * truss$Bar$Length[i]
+            truss$Bar$L2[i]  <<- (1 - t) * truss$Bar$Length[i]
+            truss$Bar$L_b[i] <<- max(truss$Bar$L1[i], truss$Bar$L2[i])
+          }
+        }
+      }
+    }
+
+    Effective_length_function <- function() {
+      truss$Bar$EffectiveLength <<- ifelse(is.na(truss$Bar$L_b),
+                                           truss$Bar$Length,
+                                           truss$Bar$L_b) * truss$Single_value_constant$K
+    }
+
+    clean_bar()
+    bar_length()
+    L_crossing_length()
+    Effective_length_function()
+  }
+
+  populate_aisc()
+  populate_bar()
+  return(truss)
+}
+```
+
+
+Constraint 7: valid connection system. Reads pass5 (C5). Creates: g7, allowed (sections x bars x systems)
+```{r c7}
+webchord_barlist <- function(truss) {
+
+  # "Round + PIPE" -> c("Round", "PIPE")
+  list_types <- function(cell) {
+    if (is.na(cell) || trimws(cell) == "") return(character(0))
+    trimws(strsplit(cell, "+", fixed = TRUE)[[1]])
+  }
+
+  # which sections each bar may use in each system
+  allowed <- function() {
+    truss$allowed <<- array(FALSE,
+      dim = c(nrow(truss$aisc), nrow(truss$Bar), nrow(truss$System)),
+      dimnames = list(truss$aisc$array_name_column,
+                      truss$Bar[["Bar Number"]],
+                      truss$System$System))
+
+    for (i in 1:nrow(truss$System)) {
+      chord_ok <- truss$aisc$Type %in% list_types(truss$System$Chord_List[i])
+      web_ok   <- truss$aisc$Type %in% list_types(truss$System$Web_List[i])
+
+      for (b in 1:nrow(truss$Bar)) {
+        truss$allowed[, b, i] <<- if (truss$Bar$ChordWeb[b] == "Chord") chord_ok else web_ok
+      }
+    }
+  }
+
+  allowed()
+  return(truss)
+}
+```
+
+Structure analysis. Creates: S_e, F_Dy, F_LC1y, F_LC2y, F_SLS1y, F, K, u, stretch, N, R, N_t, N_c, CompTension, r_required, uy_max, check_Rx, check_Ry
+```{r structure}
+structure_function <- function(truss) {
+
+  key      <- truss$aisc$array_name_column
+  bar      <- truss$Bar[["Bar Number"]]
+  joint    <- truss$Joint$JointNumber
+  nb       <- nrow(truss$Bar)
+  ndof     <- 2 * nrow(truss$Joint)
+  lc_names <- c("LC1", "LC2", "SLS1")
+
+  # support flags by DOF number -> free (f) and restrained (r)
+  fix <- numeric(ndof)
+  fix[truss$Joint$x_dof] <- truss$Joint$x_fix
+  fix[truss$Joint$y_dof] <- truss$Joint$y_fix
+  free <- which(fix == 0)
+  rest <- which(fix == 1)
+
+  # ---------- 6.1, 6.2 self weight ----------
+  self_weight <- function() {
+    W_e <- matrix(truss$aisc$W, length(key), length(bar), dimnames = list(key, bar))
+    L_e <- matrix(truss$Bar$Length, length(key), length(bar), byrow = TRUE,
+                  dimnames = list(key, bar))
+    truss$S_e <<- W_e * L_e / 12000
+  }
+
+  # ---------- 6.3 loads ----------
+  PLPL_xy <- function() {
+    truss$Joint$PD_x[is.na(truss$Joint$PD_x)] <<- 0
+    truss$Joint$PD_y[is.na(truss$Joint$PD_y)] <<- 0
+    truss$Joint$PL_x[is.na(truss$Joint$PL_x)] <<- 0
+    truss$Joint$PL_y[is.na(truss$Joint$PL_y)] <<- 0
+
+    truss$Joint$FL_x <<- truss$Joint$PL_x
+    truss$Joint$FL_y <<- truss$Joint$PL_y
+    truss$Joint$FD_x <<- truss$Joint$PD_x
+
+    F_Dy <- matrix(0, length(key), length(joint), dimnames = list(key, joint))
+    for (j in 1:nrow(truss$Joint)) {
+      bars <- which(truss$Bar$FromJoint == joint[j] | truss$Bar$ToJoint == joint[j])
+      F_Dy[, j] <- truss$Joint$PD_y[j] - rowSums(truss$S_e[, bars, drop = FALSE]) / 2
+    }
+    truss$F_Dy <<- F_Dy
+
+    truss$Joint$FLC1_x  <<- 1.4 * truss$Joint$FD_x
+    truss$Joint$FLC2_x  <<- 1.2 * truss$Joint$FD_x + 1.6 * truss$Joint$FL_x
+    truss$Joint$FSLS1_x <<- truss$Joint$FD_x + truss$Joint$FL_x
+
+    FL_y_mat <- matrix(truss$Joint$FL_y, length(key), length(joint), byrow = TRUE,
+                       dimnames = list(key, joint))
+    truss$F_LC1y  <<- 1.4 * F_Dy
+    truss$F_LC2y  <<- 1.2 * F_Dy + 1.6 * FL_y_mat
+    truss$F_SLS1y <<- F_Dy + FL_y_mat
+  }
+
+  # ---------- load vectors by DOF: sections x DOFs x combinations ----------
+  load_vectors <- function() {
+    truss$F <<- array(0, dim = c(length(key), ndof, length(lc_names)),
+                      dimnames = list(key, NULL, lc_names))
+
+    for (j in 1:nrow(truss$Joint)) {
+      xd <- truss$Joint$x_dof[j]
+      yd <- truss$Joint$y_dof[j]
+
+      truss$F[, xd, "LC1"]  <<- truss$Joint$FLC1_x[j]
+      truss$F[, xd, "LC2"]  <<- truss$Joint$FLC2_x[j]
+      truss$F[, xd, "SLS1"] <<- truss$Joint$FSLS1_x[j]
+
+      truss$F[, yd, "LC1"]  <<- truss$F_LC1y[, j]
+      truss$F[, yd, "LC2"]  <<- truss$F_LC2y[, j]
+      truss$F[, yd, "SLS1"] <<- truss$F_SLS1y[, j]
+    }
+  }
+
+  # ---------- 6.4 stiffness ----------
+  stiffness <- function() {
+    dof <- c("x_from", "y_from", "x_to", "y_to")
+    k_e <- array(NA, dim = c(length(key), nb, 4, 4), dimnames = list(key, bar, dof, dof))
+
+    for (b in 1:nb) {
+      v <- c(truss$Bar$cos[b], truss$Bar$sin[b], -truss$Bar$cos[b], -truss$Bar$sin[b])
+      coef <- truss$Single_value_constant$E * truss$aisc$A / truss$Bar$Length[b]
+      k_e[, b, , ] <- outer(coef, outer(v, v))
+    }
+
+    truss$K <<- array(0, dim = c(length(key), ndof, ndof), dimnames = list(key, NULL, NULL))
+
+    for (b in 1:nb) {
+      from_row <- match(truss$Bar$FromJoint[b], truss$Joint$JointNumber)
+      to_row   <- match(truss$Bar$ToJoint[b],   truss$Joint$JointNumber)
+      d <- c(truss$Joint$x_dof[from_row], truss$Joint$y_dof[from_row],
+             truss$Joint$x_dof[to_row],   truss$Joint$y_dof[to_row])
+      truss$K[, d, d] <<- truss$K[, d, d] + k_e[, b, , ]
+    }
+  }
+
+  # ---------- 6.5 movements ----------
+  solve_u <- function() {
+    truss$u <<- array(0, dim = c(length(key), ndof, length(lc_names)),
+                      dimnames = list(key, NULL, lc_names))
+
+    for (lc in lc_names) {
+      for (s in 1:length(key)) {
+        if (anyNA(truss$K[s, free, free])) next        # invalid section stays 0
+        truss$u[s, free, lc] <<- solve(truss$K[s, free, free], truss$F[s, free, lc])
+      }
+    }
+  }
+
+  # ---------- 6.6 stretch and axial force ----------
+  stretch_N <- function() {
+    truss$stretch <<- array(NA, dim = c(length(key), nb, length(lc_names)),
+                            dimnames = list(key, bar, lc_names))
+    truss$N <<- truss$stretch
+
+    for (b in 1:nb) {
+      from_row <- match(truss$Bar$FromJoint[b], truss$Joint$JointNumber)
+      to_row   <- match(truss$Bar$ToJoint[b],   truss$Joint$JointNumber)
+      xf <- truss$Joint$x_dof[from_row];  yf <- truss$Joint$y_dof[from_row]
+      xt <- truss$Joint$x_dof[to_row];    yt <- truss$Joint$y_dof[to_row]
+
+      coef <- truss$Single_value_constant$E * truss$aisc$A / truss$Bar$Length[b]
+
+      for (lc in lc_names) {
+        du_x <- truss$u[, xt, lc] - truss$u[, xf, lc]
+        du_y <- truss$u[, yt, lc] - truss$u[, yf, lc]
+
+        truss$stretch[, b, lc] <<- truss$Bar$cos[b] * du_x + truss$Bar$sin[b] * du_y
+        truss$N[, b, lc]       <<- coef * truss$stretch[, b, lc]
+      }
+    }
+  }
+
+  # ---------- 6.7 support reactions ----------
+  reactions <- function() {
+    truss$R <<- array(NA, dim = c(length(key), length(rest), length(lc_names)),
+                      dimnames = list(key, rest, lc_names))
+
+    for (lc in lc_names) {
+      for (s in 1:length(key)) {
+        truss$R[s, , lc] <<- truss$K[s, rest, ] %*% truss$u[s, , lc] - truss$F[s, rest, lc]
+      }
+    }
+  }
+
+  # ---------- 6.7 check ----------
+  reaction_check <- function() {
+    ydofs <- truss$Joint$y_dof
+    xdofs <- truss$Joint$x_dof
+
+    truss$check_Ry <<- sapply(lc_names, function(lc)
+      rowSums(truss$R[, as.character(intersect(ydofs, rest)), lc, drop = FALSE]) +
+      rowSums(truss$F[, ydofs, lc]))
+
+    truss$check_Rx <<- sapply(lc_names, function(lc)
+      rowSums(truss$R[, as.character(intersect(xdofs, rest)), lc, drop = FALSE]) +
+      rowSums(truss$F[, xdofs, lc]))
+  }
+
+  # ---------- 6.8 results passed to the checks ----------
+  results <- function() {
+
+    # round so floating-point noise (1e-12) is not read as tension or compression
+    N1 <- round(truss$N[, , "LC1"], 8)
+    N2 <- round(truss$N[, , "LC2"], 8)
+
+    truss$N_t <<- pmax(N1, N2, 0)
+    truss$N_c <<- pmax(-N1, -N2, 0)
+
+    truss$CompTension <<- ifelse(truss$N_c > 0, "Compression",
+                          ifelse(truss$N_t > 0, "Tension", "Zero"))
+
+    Lc_mat <- matrix(truss$Bar$EffectiveLength, length(key), nb, byrow = TRUE,
+                     dimnames = list(key, bar))
+    L_mat  <- matrix(truss$Bar$Length, length(key), nb, byrow = TRUE,
+                     dimnames = list(key, bar))
+
+    truss$r_required <<- ifelse(truss$CompTension == "Compression",
+                                Lc_mat / truss$Single_value_constant$slender_max_c,
+                         ifelse(truss$CompTension == "Tension",
+                                L_mat / truss$Single_value_constant$slender_max_t, NA))
+
+    free_y <- intersect(truss$Joint$y_dof, free)
+    truss$uy_max <<- apply(abs(truss$u[, free_y, "SLS1", drop = FALSE]), 1, max)
+  }
+
+  self_weight()
+  PLPL_xy()
+  load_vectors()
+  stiffness()
+  solve_u()
+  stretch_N()
+  reactions()
+  reaction_check()
+  results()
+
+  return(truss)
+}
+```
+
+Constraints 1 and 2: capacity. Needs CompTension, N_t, N_c from structure_function. Creates: aisc capacity columns, phi_Pn_t, Fe, phi_Pn_c, phi_Pn, g_cap
+```{r phi_Pn}
+phi_Pn_function <- function(truss) {
+
+  key <- truss$aisc$array_name_column
+  bar <- truss$Bar[["Bar Number"]]
+  nb  <- nrow(truss$Bar)
+
+  # constraint 1: tension capacity (one value per section)
+  phi_Pn_t_function <- function() {
+
+    truss$Single_value_constant$d_h <<- truss$Single_value_constant$d_b + 1/8
+
+    truss$aisc$n_h <<- truss$Family$n_h[match(truss$aisc$Type, truss$Family$FamilyName)]
+    truss$aisc$U   <<- truss$Family$U[match(truss$aisc$Type, truss$Family$FamilyName)]
+    truss$aisc$Fy  <<- truss$Family$Fy[match(truss$aisc$Type, truss$Family$FamilyName)]
+    truss$aisc$Fu  <<- truss$Family$Fu[match(truss$aisc$Type, truss$Family$FamilyName)]
+
+    truss$aisc$A_n <<- truss$aisc$A - truss$aisc$n_h * truss$Single_value_constant$d_h * truss$aisc$t_net
+    truss$aisc$A_e <<- truss$aisc$A_n * truss$aisc$U
+
+    truss$aisc$phi_P_n_y <<- truss$Single_value_constant$phi_ty * truss$aisc$Fy * truss$aisc$A
+    truss$aisc$phi_P_n_r <<- truss$Single_value_constant$phi_tr * truss$aisc$Fu * truss$aisc$A_e
+    truss$aisc$phi_P_n   <<- pmin(truss$aisc$phi_P_n_r, truss$aisc$phi_P_n_y)
+
+    # same value across bars -> sections x bars
+    truss$phi_Pn_t <<- matrix(truss$aisc$phi_P_n, length(key), nb, dimnames = list(key, bar))
+  }
+
+  # constraint 2: compression capacity (sections x bars)
+  phi_Pn_c_function <- function() {
+
+    Fe <- matrix(NA, length(key), nb, dimnames = list(key, bar))
+
+    for (i in 1:nrow(truss$aisc)) {
+
+      if (truss$aisc$Type[i] %in% c("Rectangle", "Round", "PIPE", "WShape", "W")) {
+        Fe[i, ] <- pi^2 * truss$Single_value_constant$E /
+                   (truss$Bar$EffectiveLength / truss$aisc$r_min[i])^2
+
+      } else if (truss$aisc$Type[i] %in% c("WT", "2L")) {
+        Fex <- pi^2 * truss$Single_value_constant$E /
+               (truss$Bar$EffectiveLength / truss$aisc$rx[i])^2
+
+        Fey <- pi^2 * truss$Single_value_constant$E /
+               (truss$Bar$EffectiveLength / truss$aisc$ry[i])^2
+
+        Fez <- truss$Single_value_constant$G * truss$aisc$J[i] /
+               (truss$aisc$A[i] * truss$aisc$ro[i]^2)
+
+        Fe_FT <- (Fey + Fez) / (2 * truss$aisc$H[i]) *
+                 (1 - sqrt(1 - 4 * Fey * Fez * truss$aisc$H[i] / (Fey + Fez)^2))
+
+        Fe[i, ] <- pmin(Fex, Fe_FT)
+      }
+    }
+
+    family <- sub("--.*$", "", rownames(Fe))
+    Fy_row <- truss$Family$Fy[match(family, truss$Family$FamilyName)]
+    Fy <- matrix(Fy_row, nrow(Fe), ncol(Fe), dimnames = dimnames(Fe))
+    ratio <- Fy / Fe
+    Fcr <- ifelse(ratio <= 2.25, 0.658^ratio * Fy, 0.877 * Fe)
+    Ag_row <- truss$aisc$A[match(rownames(Fcr), truss$aisc$array_name_column)]
+    Ag <- matrix(Ag_row, nrow(Fcr), ncol(Fcr), dimnames = dimnames(Fcr))
+
+    truss$Fe       <<- Fe
+    truss$phi_Pn_c <<- truss$Single_value_constant$phi_c * Fcr * Ag
+  }
+
+  # phi_c Pn: compression value for compression bars, tension value for tension bars
+  phi_Pn_final <- function() {
+    truss$phi_Pn <<- ifelse(truss$CompTension == "Compression", truss$phi_Pn_c,
+                     ifelse(truss$CompTension == "Tension",     truss$phi_Pn_t, NA))
+  }
+
+  # demand / capacity - 1 (<= 0 is OK). Zero bars carry no force, so they pass.
+  capacity_check <- function() {
+    truss$g_cap <<- ifelse(truss$CompTension == "Compression", truss$N_c / truss$phi_Pn - 1,
+                    ifelse(truss$CompTension == "Tension",     truss$N_t / truss$phi_Pn - 1, -1))
+  }
+
+  phi_Pn_t_function()
+  phi_Pn_c_function()
+  phi_Pn_final()
+  capacity_check()
+  return(truss)
+}
+```
+
+```{r phi_Mn}
+# flexural capacity phi_b Mn per section and bar (kip-in), AISC 360-16 Chapter F
+# bending about x (strong axis across the truss plane); WT and 2L flange up, stem in tension
+phi_Mn_function <- function(truss) {
+
+  key <- truss$aisc$array_name_column
+  bar <- truss$Bar[["Bar Number"]]
+  nb  <- nrow(truss$Bar)
+  E   <- truss$Single_value_constant$E
+  Cb  <- truss$Single_value_constant$Cb
+  Lb  <- truss$Bar$EffectiveLength                       # unbraced length for LTB, one per bar
+  Fy  <- truss$Family$Fy[match(truss$aisc$Type, truss$Family$FamilyName)]
+  num <- function(x) suppressWarnings(as.numeric(x))
+
+  Mn <- matrix(NA_real_, length(key), nb, dimnames = list(key, bar))
+
+  for (i in 1:nrow(truss$aisc)) {
+
+    type <- truss$aisc$Type[i]
+    fy   <- Fy[i]
+    s    <- sqrt(E / fy)
+    Zx   <- truss$aisc$Zx[i]
+    Sx   <- truss$aisc$Sx[i]
+    Mp   <- fy * Zx                                       # F2-1, F7-1, F8-1
+    My   <- fy * Sx
+
+    if (type == "Rectangle") {                            # F7
+      bt <- num(truss$aisc$`b/tdes`[i])
+      ht <- num(truss$aisc$`h/tdes`[i])
+      Mn_f <- if (bt <= 1.12 * s) Mp else
+              min(Mp, Mp - (Mp - My) * (3.57 * bt * sqrt(fy / E) - 4.0))      # F7-2
+      Mn_w <- if (ht <= 2.42 * s) Mp else
+              min(Mp, Mp - (Mp - My) * (0.305 * ht * sqrt(fy / E) - 0.738))  # F7-6
+      Mn[i, ] <- min(Mp, Mn_f, Mn_w)
+
+    } else if (type %in% c("Round", "PIPE")) {            # F8, no LTB
+      Dt <- num(truss$aisc$`D/t`[i])
+      Mn[i, ] <- if (Dt <= 0.07 * E / fy) Mp else
+                 if (Dt <= 0.31 * E / fy) min(Mp, (0.021 * E / Dt + fy) * Sx) else   # F8-2
+                 (0.33 * E / Dt) * Sx                                                # F8-3, F8-4
+
+    } else if (type %in% c("WShape", "W")) {              # F2 (LTB) and F3 (flange)
+      ry  <- truss$aisc$ry[i];  J  <- truss$aisc$J[i]
+      rts <- truss$aisc$rts[i]; ho <- truss$aisc$ho[i]
+      k   <- J / (Sx * ho)                                                   # c = 1
+      Lp  <- 1.76 * ry * s                                                   # F2-5
+      Lr  <- 1.95 * rts * E / (0.7 * fy) *
+             sqrt(k + sqrt(k^2 + 6.76 * (0.7 * fy / E)^2))                   # F2-6
+      Fcr <- Cb * pi^2 * E / (Lb / rts)^2 * sqrt(1 + 0.078 * k * (Lb / rts)^2)  # F2-4
+      Mn_ltb <- ifelse(Lb <= Lp, Mp,
+                ifelse(Lb <= Lr, pmin(Mp, Cb * (Mp - (Mp - 0.7 * My) * (Lb - Lp) / (Lr - Lp))),  # F2-2
+                                 pmin(Mp, Fcr * Sx)))                                            # F2-3
+      lam <- num(truss$aisc$`bf/2tf`[i]); lp <- 0.38 * s; lr <- 1.0 * s
+      kc  <- min(0.76, max(0.35, 4 / sqrt(num(truss$aisc$`h/tw`[i]))))
+      Mn_flb <- if (lam <= lp) Mp else
+                if (lam <= lr) Mp - (Mp - 0.7 * My) * (lam - lp) / (lr - lp) else   # F3-1
+                0.9 * E * kc * Sx / lam^2                                           # F3-2
+      Mn[i, ] <- pmin(Mn_ltb, Mn_flb)
+
+    } else if (type %in% c("WT", "2L")) {                 # F9, stem / web legs in tension
+      ry <- truss$aisc$ry[i]; Iy <- truss$aisc$Iy[i]
+      J  <- truss$aisc$J[i];  d  <- truss$aisc$d[i]
+      Mp  <- min(fy * Zx, 1.6 * My)                                          # F9-2
+      Lp  <- 1.76 * ry * s                                                   # F9-8
+      Lr  <- 1.95 * (E / fy) * sqrt(Iy * J) / Sx * sqrt(2.36 * (fy / E) * d * Sx / J + 1)  # F9-9
+      B   <- 2.3 * (d / Lb) * sqrt(Iy / J)                                   # F9-11
+      Mcr <- 1.95 * E / Lb * sqrt(Iy * J) * (B + sqrt(1 + B^2))              # F9-10
+      Mn_ltb <- ifelse(Lb <= Lp, Mp,
+                ifelse(Lb <= Lr, Mp - (Mp - My) * (Lb - Lp) / (Lr - Lp),     # F9-6
+                                 pmin(Mcr, Mp)))                             # F9-7
+      if (type == "WT") {                                 # F9-14, F9-15, flange in compression
+        lam <- num(truss$aisc$`bf/2tf`[i]); lp <- 0.38 * s; lr <- 1.0 * s
+        Mn_flb <- if (lam <= lp) Mp else
+                  if (lam <= lr) min(1.6 * My, Mp - (Mp - 0.7 * My) * (lam - lp) / (lr - lp)) else
+                  0.7 * E * Sx / lam^2
+      } else {                                            # 2L outstanding legs, F10-6, F10-7
+        lam <- num(truss$aisc$`b/t`[i]); lp <- 0.54 * s; lr <- 0.91 * s
+        Mn_flb <- if (lam <= lp) Mp else
+                  if (lam <= lr) fy * Sx * (2.43 - 1.72 * lam * sqrt(fy / E)) else
+                  (0.71 * E / lam^2) * Sx
+      }
+      Mn[i, ] <- pmin(Mn_ltb, Mn_flb)
+    }
+  }
+
+  truss$Mn     <- Mn
+  truss$phi_Mn <- truss$Single_value_constant$phi_b * Mn
+  return(truss)
+}
+```
+
+
+```{r moment_function}
+# self-weight moment per bar and the Appendix 8 amplifier B1 for compression bars
+moment_function <- function(truss) {
+    
+      key <- truss$aisc$array_name_column
+      bar <- truss$Bar[["Bar Number"]]
+      nb <- nrow(truss$Bar)
+      E <- truss$Single_value_constant$E
+      Cm <- truss$Single_value_constant$Cm
+      alp <- truss$Single_value_constant$alpha
+    
+      # 3.1 first-order self-weight moment, kip-in: w cos(theta) L^2 / 8, full bar length
+      w_kip_in <- truss$aisc$W / 12000       # lb/ft -> kip/in
+      M_sw <- outer(w_kip_in, abs(truss$Bar$cos) * truss$Bar$Length^2 / 8)
+      dimnames(M_sw) <- list(key, bar)
+    
+      # 3.2 Euler load in the plane of bending, kips: pi^2 E Ix / Lc1^2, Lc1 = EffectiveLength
+      Pe1 <- outer(pi^2 * E * truss$aisc$Ix, 1 / truss$Bar$EffectiveLength^2)
+      dimnames(Pe1) <- list(key, bar)
+    
+      # 3.3 B1 per combination: compression bars only (negative N); 1 otherwise.
+      # A bar at or past its Euler load gets a very large B1, so it is rejected.
+      B1_of <- function(N) {
+        Pr <- pmax(-N, 0)                    # compression as a positive
+        r <- alp * Pr / Pe1
+        ifelse(Pr == 0, 1, ifelse(r >= 1, 1e6, pmax(1, Cm / (1 - r))))
+      }
+    
+      B1_LC1 <- B1_of(truss$N_LC1)
+      B1_LC2 <- B1_of(truss$N_LC2)
+    
+      # 3.4 required moments, factored by the dead-load factor of each combination
+      truss$M_sw  <- M_sw
+      truss$Pe1   <- Pe1
+      truss$B1_LC1 <- B1_LC1
+      truss$B1_LC2 <- B1_LC2
+      truss$Mr_LC1 <- 1.4 * M_sw * B1_LC1
+      truss$Mr_LC2 <- 1.2 * M_sw * B1_LC2
+    
+      return(truss)
+    }
+```
+
+```{r interaction_function}
+# capacity check as AISC 360-16 H1-1a / H1-1b, per load combination, worst of LC1 and LC2
+interaction_function <- function(truss) {
+    
+      g_of <- function(N, Mr) {
+        Pr    <- abs(N)                                                  # kips, either sign
+        Pc    <- ifelse(N < 0, truss$phi_Pn_c, truss$phi_Pn_t)           # compression or tension capacity
+        ratio <- Pr / Pc
+        Mc    <- truss$phi_Mn
+        ifelse(ratio >= 0.2,
+               ratio     + (8 / 9) * (Mr / Mc),                          # H1-1a
+               ratio / 2 +           (Mr / Mc)) - 1                      # H1-1b (also covers N = 0)
+      }
+    
+      truss$g_cap_axial <- truss$g_cap                                   # the old axial-only value, kept for Step 2
+      truss$g_LC1 <- g_of(truss$N_LC1, truss$Mr_LC1)
+      truss$g_LC2 <- g_of(truss$N_LC2, truss$Mr_LC2)
+      truss$g_cap <- pmax(truss$g_LC1, truss$g_LC2)
+      return(truss)
+    }
+```
+
+
+
+
+ slenderness: Creates: lambda_c, lambda_t, compression_slenderness, Tension_slenderness
+```{r slenderness}
+slenderness_function <- function(truss) {
+
+  key <- truss$aisc$array_name_column
+  bar <- truss$Bar[["Bar Number"]]
+
+  # constraint 3: compression bars, uses Lc (EffectiveLength)
+  compression_slenderness <- function() {
+    truss$lambda_c <<- outer(1 / truss$aisc$r_min, truss$Bar$EffectiveLength)
+    dimnames(truss$lambda_c) <<- list(key, bar)
+
+    truss$compression_slenderness <<- ifelse(truss$N_c > 0,
+                        truss$lambda_c / truss$Single_value_constant$slender_max_c - 1,
+                        -1)
+  }
+
+  # constraint 4: tension bars only, uses Length (not EffectiveLength)
+  Tension_slenderness <- function() {
+    truss$lambda_t <<- outer(1 / truss$aisc$r_min, truss$Bar$Length)
+    dimnames(truss$lambda_t) <<- list(key, bar)
+
+    truss$Tension_slenderness <<- ifelse(truss$N_c == 0 & truss$N_t > 0,
+                        truss$lambda_t / truss$Single_value_constant$slender_max_t - 1,
+                        -1)
+  }
+
+  compression_slenderness()
+  Tension_slenderness()
+  return(truss)
+}
+```
+
+Constraint 6: deflection. Needs uy_max from structure_function. Creates: delta_allow, deflection
+```{r c6}
+deflection_function <- function(truss) {
+
+  # allowed deflection: from Single_value_constant if you add it, otherwise span / 180
+  if ("delta_allow" %in% names(truss$Single_value_constant)) {
+    delta_allow <- truss$Single_value_constant$delta_allow
+  } else {
+    delta_allow <- (max(truss$Joint$x_coordinate) - min(truss$Joint$x_coordinate)) / 180
+  }
+  truss$delta_allow <- delta_allow
+
+  # deflection = uy_max / delta_allow - 1  (<= 0 is OK), one value per section
+  truss$deflection <- truss$uy_max / delta_allow - 1
+
+  return(truss)
+}
+```
+
+```{r}
+hss_joint_function <- function(truss) {
+
+  key   <- truss$aisc$array_name_column
+  bar   <- truss$Bar[["Bar Number"]]
+  joint <- truss$Joint$JointNumber
+  ns <- length(key);  nb <- length(bar);  nj <- length(joint)
+  E  <- truss$Single_value_constant$E
+
+  is_rect  <- truss$aisc$Type == "Rectangle"
+  is_round <- truss$aisc$Type %in% c("Round", "PIPE")
+  is_hss   <- is_rect | is_round
+
+  Fy <- truss$Family$Fy[match(truss$aisc$Type, truss$Family$FamilyName)]
+  Fu <- truss$Family$Fu[match(truss$aisc$Type, truss$Family$FamilyName)]
+
+  # chord section sizes (NA when the shape does not have that size)
+  B  <- ifelse(is_rect,  truss$aisc$B,  NA)
+  H  <- ifelse(is_rect,  truss$aisc$Ht, NA)
+  D  <- ifelse(is_round, truss$aisc$OD, NA)
+  tt <- truss$aisc$tdes
+
+  # web sizes: same section on every bar
+  Bb <- B;  Hb <- H;  Db <- D;  tb <- tt;  Fyb <- Fy
+
+  from <- truss$Bar$FromJoint
+  to   <- truss$Bar$ToJoint
+  role <- truss$Bar$ChordWeb
+
+  hss_joint_check <- function() {
+
+    # ---- per section ----
+    g81 <- ifelse(is_rect, pmax(B, H) / tt / 35, D / tt / 50) - 1            # chord wall
+    g85 <- pmax(H / B / 2, 0.5 / (H / B), Hb / Bb / 2, 0.5 / (Hb / Bb)) - 1  # aspect ratio (Rectangle)
+    g87 <- ifelse(is_rect, Fy / 52,                                          # Rectangle: Fy/Fu waived (A500 Gr. C)
+                           pmax(Fy / 52, (Fy / Fu) / 0.8)) - 1               # steel
+
+    # ---- per section and bar: web wall, pushed or pulled ----
+    pushed   <- truss$CompTension == "Compression"
+    wall_b   <- ifelse(is_rect, pmax(Bb, Hb) / tb, Db / tb)
+    lim_push <- ifelse(is_rect, 1.25 * sqrt(E / Fyb), 0.05 * E / Fyb)
+    lim_pull <- ifelse(is_rect, 35, 50)
+    lim      <- ifelse(pushed, lim_push, lim_pull)
+    g82      <- wall_b / lim - 1                                             # sections x bars
+
+    # ---- per joint ----
+    g8_joint <- matrix(-1, ns, nj, dimnames = list(key, joint))
+
+    for (j in seq_len(nj)) {
+      at     <- which(from == joint[j] | to == joint[j])
+      chords <- at[role[at] == "Chord"]
+      webs   <- at[role[at] == "Web"]
+      if (length(chords) == 0 || length(webs) == 0) next    # joint not checked
+
+      n_web <- length(webs)
+      is_K  <- n_web >= 2
+
+      # angle between web and chord (worst pair at this joint)
+      cos_t <- abs(outer(truss$Bar$cos[webs], truss$Bar$cos[chords]) +
+                   outer(truss$Bar$sin[webs], truss$Bar$sin[chords]))
+      theta <- acos(pmin(cos_t, 1)) * 180 / pi
+      g86   <- max(30 / theta) - 1
+
+      # web wall: worst web bar at the joint
+      g82_j <- apply(g82[, webs, drop = FALSE], 1, max)
+
+      # web size vs chord size
+      g83_rect  <- Bb / B - 1
+      d_min     <- if (is_K) 0.4 else 0.2          # T/Y limit assumed, check K3.1A
+      g83_round <- pmax(Db / D, d_min / (Db / D)) - 1
+      g83       <- ifelse(is_rect, g83_rect, g83_round)
+
+      # rectangle width limit
+      if (is_K) {
+        beta_eff <- n_web * (Bb + Hb) / (4 * B)
+        g84 <- 0.35 / beta_eff - 1
+      } else {
+        g84 <- 0.25 / (Bb / B) - 1                  # T/Y limit assumed, check your sheet
+      }
+
+      g8_joint[, j] <- pmax(g81, g82_j, g83, g84, g85, g86, g87, na.rm = TRUE)
+    }
+
+    g8_joint[!is_hss, ] <- -1                       # non-HSS sections always pass
+
+    # ---- bar value = worst of its two end joints ----
+    g8 <- matrix(-1, ns, nb, dimnames = list(key, bar))
+    for (b in seq_len(nb)) {
+      jf <- match(from[b], joint)
+      jt <- match(to[b],   joint)
+      g8[, b] <- pmax(g8_joint[, jf], g8_joint[, jt])
+    }
+
+    truss$g8_joint <<- g8_joint
+    truss$g8       <<- g8
+  }
+
+  hss_joint_check()
+  return(truss)
+}
+```
+
+
+
+Stack everything. Creates: arr (sections x bars x layers), g_max and feasible (sections x bars x systems). NOTE: now has a plot argument so the loop does not draw every iteration.
+```{r stack}
+stack_function <- function(truss, plot = TRUE) {
+
+  key <- truss$aisc$array_name_column
+  bar <- truss$Bar[["Bar Number"]]
+  sys <- dimnames(truss$allowed)[[3]]
+
+  group_col   <- "Group"            # name of the group column in the Bar sheet
+  hss_systems <- c("S1", "S2")      # welded HSS systems, C8 applies here only
+
+  stack_arr <- function() {
+    layers <- c("Fe", "phi_Pn", "N_t", "N_c",
+                "compression_slenderness", "Tension_slenderness", "g_cap", "deflection", "g8")
+
+    truss$arr <<- array(NA, dim = c(length(key), length(bar), length(layers)),
+                        dimnames = list(key, bar, layers))
+
+    truss$arr[, , "Fe"]                      <<- truss$Fe
+    truss$arr[, , "phi_Pn"]                  <<- truss$phi_Pn
+    truss$arr[, , "N_t"]                     <<- truss$N_t
+    truss$arr[, , "N_c"]                     <<- truss$N_c
+    truss$arr[, , "compression_slenderness"] <<- truss$compression_slenderness
+    truss$arr[, , "Tension_slenderness"]     <<- truss$Tension_slenderness
+    truss$arr[, , "g_cap"]                   <<- truss$g_cap
+    truss$arr[, , "g8"]                      <<- truss$g8
+
+    truss$deflection_mat <<- matrix(truss$deflection, length(key), length(bar),
+                                    dimnames = list(key, bar))
+    truss$arr[, , "deflection"]              <<- truss$deflection_mat
+  }
+
+  link_constraints <- function() {
+    truss$g_max <<- array(NA, dim = c(length(key), length(bar), length(sys)),
+                          dimnames = list(key, bar, sys))
+
+    for (i in seq_along(sys)) {
+      g_system <- ifelse(truss$allowed[, , i], -1, 1)
+      g8_sys   <- if (sys[i] %in% hss_systems) truss$g8 else -1     # S3-S5: g8 = -1
+
+      truss$g_max[, , i] <<- pmax(truss$compression_slenderness,
+                                  truss$Tension_slenderness,
+                                  truss$g_cap,
+                                  truss$deflection_mat,
+                                  g8_sys,
+                                  g_system)
+    }
+
+    truss$feasible <<- !is.na(truss$g_max) & truss$g_max <= 0
+  }
+
+  group_filter <- function() {
+
+    if (!group_col %in% names(truss$Bar))
+      stop("group_filter: column '", group_col, "' not found in truss$Bar")
+
+    grp <- as.character(truss$Bar[[group_col]])
+    empty <- is.na(grp) | trimws(grp) == ""
+    grp[empty] <- paste0("solo_", bar[empty])
+
+    truss$feasible_group <<- truss$feasible
+
+    for (g in unique(grp)) {
+      cols <- which(grp == g)
+
+      for (i in seq_along(sys)) {
+        ok <- apply(truss$feasible[, cols, i, drop = FALSE], 1, all)
+        truss$feasible_group[, cols, i] <<- matrix(ok, length(key), length(cols))
+      }
+    }
+  }
+
+  plot_stack <- function() {
+    op <- par(mfrow = c(1, 2), mar = c(5, 5, 4, 2))
+    on.exit(par(op))
+
+    cnt <- apply(truss$feasible_group, c(2, 3), sum)
+    image(x = 1:nrow(cnt), y = 1:ncol(cnt), z = cnt,
+          col = hcl.colors(50, "YlGnBu", rev = TRUE),
+          axes = FALSE, xlab = "Bar", ylab = "System",
+          main = "Feasible sections per bar and system (grouped)")
+    axis(1, at = 1:nrow(cnt), labels = rownames(cnt))
+    axis(2, at = 1:ncol(cnt), labels = colnames(cnt), las = 1)
+    text(rep(1:nrow(cnt), ncol(cnt)), rep(1:ncol(cnt), each = nrow(cnt)),
+         labels = as.vector(cnt), cex = 0.7)
+    box()
+
+    lay  <- c("compression_slenderness", "Tension_slenderness", "g_cap", "deflection", "g8")
+    viol <- sapply(lay, function(l) apply(truss$arr[, , l] > 0, 2, mean, na.rm = TRUE))
+    image(x = 1:nrow(viol), y = 1:ncol(viol), z = viol, zlim = c(0, 1),
+          col = hcl.colors(50, "Reds", rev = TRUE),
+          axes = FALSE, xlab = "Bar", ylab = "Constraint",
+          main = "Share of sections violating")
+    axis(1, at = 1:nrow(viol), labels = rownames(viol))
+    axis(2, at = 1:ncol(viol), labels = colnames(viol), las = 1, cex.axis = 0.6)
+    text(rep(1:nrow(viol), ncol(viol)), rep(1:ncol(viol), each = nrow(viol)),
+         labels = round(as.vector(viol), 2), cex = 0.7)
+    box()
+  }
+
+  stack_arr()
+  link_constraints()
+  group_filter()
+  if (plot) plot_stack()
+  return(truss)
+}
+```
+
+```{r}
+funnel_function <- function(truss) {
+
+  key <- truss$aisc$array_name_column
+  bar <- truss$Bar[["Bar Number"]]
+  sys <- dimnames(truss$allowed)[[3]]
+
+  hss_systems <- c("S1", "S2")      # C8 applies here only
+  layers <- c("compression_slenderness", "Tension_slenderness",
+              "g_cap", "deflection", "g8")
+  stages <- c("allowed", layers, "group")
+
+  # survivors after each stage: stages x bars x systems
+  f <- array(NA, dim = c(length(stages), length(bar), length(sys)),
+             dimnames = list(stages, bar, sys))
+
+  for (i in seq_along(sys)) {
+    ok <- truss$allowed[, , i]
+    f["allowed", , i] <- colSums(ok)
+
+    for (l in layers) {
+      if (!(l == "g8" && !(sys[i] %in% hss_systems))) {   # g8 skipped in S3-S5
+        g  <- truss$arr[, , l]
+        ok <- ok & !is.na(g) & g <= 0                      # NA counts as failed
+      }
+      f[l, , i] <- colSums(ok)
+    }
+
+    f["group", , i] <- colSums(truss$feasible_group[, , i])
+  }
+  truss$funnel <- f
+
+  # ---------- plot: one panel per system, one grey line per bar, red = average ----------
+  op <- par(mfrow = c(2, 3), mar = c(8, 4, 3, 1))
+  on.exit(par(op))
+
+  for (i in seq_along(sys)) {
+    matplot(f[, , i], type = "l", lty = 1, col = "grey70", xaxt = "n",
+            xlab = "", ylab = "Sections remaining", main = paste("Funnel,", sys[i]),
+            ylim = c(0, max(f)))
+    lines(rowMeans(f[, , i]), col = "red", lwd = 3)
+    axis(1, at = seq_along(stages), labels = stages, las = 2, cex.axis = 0.7)
+  }
+
+  return(truss)
+}
+
+```
+
+
+```{r}
+cost_function <- function(truss) {
+
+  key <- truss$aisc$array_name_column
+  bar <- truss$Bar[["Bar Number"]]
+  sys <- dimnames(truss$feasible_group)[[3]]
+
+  group_col <- "Group"                 # same group column as stack_function
+
+  # ---------- cost of every section on every bar (sections x bars) ----------
+  cost_matrix <- function() {
+    weight_lb <- outer(truss$aisc$W, truss$Bar$Length) / 12       # lb/ft * in / 12
+    cost <- weight_lb * truss$aisc$CostLevel1                     # price per lb, per section row
+    dimnames(cost) <- list(key, bar)
+    truss$cost <<- cost
+  }
+
+  # ---------- cheapest feasible section per group and system ----------
+  select_cheapest <- function() {
+
+    grp <- as.character(truss$Bar[[group_col]])
+    empty <- is.na(grp) | trimws(grp) == ""
+    grp[empty] <- paste0("solo_", bar[empty])
+
+    out <- list()
+
+    for (i in seq_along(sys)) {
+      for (g in unique(grp)) {
+        cols <- which(grp == g)
+
+        ok <- truss$feasible_group[, cols[1], i]                  # same for every bar in the group
+        group_cost <- rowSums(truss$cost[, cols, drop = FALSE])   # group shares one section
+        group_cost[!ok | is.na(group_cost)] <- Inf
+
+        best <- which.min(group_cost)
+        found <- is.finite(group_cost[best])
+
+        out[[length(out) + 1]] <- data.frame(
+          System  = sys[i],
+          Group   = g,
+          Bars    = paste(bar[cols], collapse = ","),
+          Section = if (found) key[best] else NA_character_,
+          Cost    = if (found) group_cost[best] else NA_real_,
+          stringsAsFactors = FALSE
+        )
+      }
+    }
+
+    truss$selection <<- do.call(rbind, out)
+
+    # total per system; NA if any group has no feasible section
+    truss$total_cost <<- sapply(sys, function(s) {
+      x <- truss$selection$Cost[truss$selection$System == s]
+      if (anyNA(x)) NA_real_ else sum(x)
+    })
+  }
+
+  cost_matrix()
+  select_cheapest()
+  return(truss)
+}
+
+```
+
+
+Run the existing (uniform-section) pipeline first. This gives the starting design for the loop.
+```{r run}
+truss <- populate_tables(truss)
+truss <- webchord_barlist(truss)
+truss <- structure_function(truss)
+truss <- phi_Pn_function(truss)
+truss <- slenderness_function(truss)
+truss <- deflection_function(truss)
+truss <- hss_joint_function(truss)
+truss <- stack_function(truss)
+truss <- funnel_function(truss)
+truss <- cost_function(truss)
+```
+
+```{r}
+apply(truss$feasible, 3, sum)                      # feasible cells per system
+apply(truss$feasible, c(2, 3), sum)                # feasible sections per bar x system
+names(which(truss$feasible[, "1", "S1"]))          # sections OK for bar 1 in S1 (use your bar label)
+```
+
+```{r}
+apply(truss$feasible_group, 3, sum)                      # feasible cells per system
+apply(truss$feasible_group, c(2, 3), sum)                # feasible sections per bar x system
+names(which(truss$feasible_group[, "1", "S1"]))          # sections OK for bar 1 in S1 (use your bar label)
+```
+
+```{r}
+truss$total_cost                                  # cheapest total per system (NA = no feasible design)
+truss$selection                                   # chosen section and cost for each group and system
+truss$selection[truss$selection$System == "S1", ]
+```
+
+
+NEW: mixed-section analysis with grouping inside the loop.
+
+analyze_design: analysis of ONE design, each bar has its own section (bars in a group share one).
+```{r analyze_design}
+analyze_design <- function(truss, sec_bar) {
+  lc_names <- c("LC1", "LC2", "SLS1")
+  nb   <- nrow(truss$Bar)
+  nj   <- nrow(truss$Joint)
+  ndof <- 2 * nj
+  E    <- truss$Single_value_constant$E
+  L    <- truss$Bar$Length
+
+  A_b <- truss$aisc$A[sec_bar]
+  W_b <- truss$aisc$W[sec_bar]
+  S_b <- W_b * L / 12000                               # self weight per bar
+
+  from_row <- match(truss$Bar$FromJoint, truss$Joint$JointNumber)
+  to_row   <- match(truss$Bar$ToJoint,   truss$Joint$JointNumber)
+  xd <- truss$Joint$x_dof
+  yd <- truss$Joint$y_dof
+
+  fix <- numeric(ndof)
+  fix[xd] <- truss$Joint$x_fix
+  fix[yd] <- truss$Joint$y_fix
+  free <- which(fix == 0)
+
+  # self weight split half to each end joint
+  Sj <- numeric(nj)
+  for (b in 1:nb) {
+    Sj[from_row[b]] <- Sj[from_row[b]] + S_b[b] / 2
+    Sj[to_row[b]]   <- Sj[to_row[b]]   + S_b[b] / 2
+  }
+  FD_y <- truss$Joint$PD_y - Sj
+  FD_x <- truss$Joint$PD_x
+  FL_x <- truss$Joint$PL_x
+  FL_y <- truss$Joint$PL_y
+
+  F <- matrix(0, ndof, 3, dimnames = list(NULL, lc_names))
+  F[xd, "LC1"]  <- 1.4 * FD_x
+  F[xd, "LC2"]  <- 1.2 * FD_x + 1.6 * FL_x
+  F[xd, "SLS1"] <- FD_x + FL_x
+  F[yd, "LC1"]  <- 1.4 * FD_y
+  F[yd, "LC2"]  <- 1.2 * FD_y + 1.6 * FL_y
+  F[yd, "SLS1"] <- FD_y + FL_y
+
+  # stiffness with each bar's own area
+  coef <- E * A_b / L
+  K <- matrix(0, ndof, ndof)
+  for (b in 1:nb) {
+    v <- c(truss$Bar$cos[b], truss$Bar$sin[b], -truss$Bar$cos[b], -truss$Bar$sin[b])
+    d <- c(xd[from_row[b]], yd[from_row[b]], xd[to_row[b]], yd[to_row[b]])
+    K[d, d] <- K[d, d] + coef[b] * outer(v, v)
+  }
+
+  u <- matrix(0, ndof, 3, dimnames = list(NULL, lc_names))
+  u[free, ] <- solve(K[free, free], F[free, ])
+
+  N <- matrix(NA, nb, 3, dimnames = list(NULL, lc_names))
+  for (b in 1:nb) {
+    for (lc in lc_names) {
+      du_x <- u[xd[to_row[b]], lc] - u[xd[from_row[b]], lc]
+      du_y <- u[yd[to_row[b]], lc] - u[yd[from_row[b]], lc]
+      N[b, lc] <- coef[b] * (truss$Bar$cos[b] * du_x + truss$Bar$sin[b] * du_y)
+    }
+  }
+
+  list(N = N,
+       uy_max = max(abs(u[intersect(yd, free), "SLS1"])))
+}
+```
+
+set_demands, evaluate_design, design_loop (FIXED: a group with no feasible section is "stuck", never "converged")
+```{r design_loop}
+# ---- put the real demands into the section x bar matrices the checks expect ----
+set_demands <- function(truss, an) {
+  key <- truss$aisc$array_name_column
+  bar <- truss$Bar[["Bar Number"]]
+  rep_row <- function(v) matrix(v, length(key), length(bar), byrow = TRUE,
+                                dimnames = list(key, bar))
+
+  N1 <- round(an$N[, "LC1"], 8)
+  N2 <- round(an$N[, "LC2"], 8)
+  Nt <- pmax(N1, N2, 0)
+  Nc <- pmax(-N1, -N2, 0)
+  truss$N_LC1 <- rep_row(N1)  # signed: + tension, - compression
+
+  truss$N_LC2 <- rep_row(N2)
+
+  truss$N_t <- rep_row(Nt)
+  truss$N_c <- rep_row(Nc)
+  truss$CompTension <- ifelse(truss$N_c > 0, "Compression",
+                       ifelse(truss$N_t > 0, "Tension", "Zero"))
+
+  # deflection is a whole-design check, handled in the loop, so neutralise it here
+  truss$uy_max <- setNames(rep(0, length(key)), key)
+  truss
+}
+
+# ---- run all the per-section checks against the current demands ----
+evaluate_design <- function(truss, an) {
+  truss <- set_demands(truss, an)
+  truss <- phi_Pn_function(truss)
+  truss <- phi_Mn_function(truss) 
+  truss <- moment_function(truss)
+  truss <- interaction_function(truss)  
+  truss <- slenderness_function(truss)
+  truss <- deflection_function(truss)
+  truss <- hss_joint_function(truss)
+  truss <- stack_function(truss, plot = FALSE)
+  truss <- cost_function(truss)
+  truss
+}
+
+# ---- the loop: sections are chosen per group, and the analysis sees them ----
+# start = named vector (group -> section) or NULL (use the uniform-pipeline result)
+# quiet = TRUE turns off messages (used by multi_start)
+design_loop <- function(truss, system = "S1", start = NULL, max_iter = 30,
+                        defl_bump = 1.10, quiet = FALSE) {
+
+  key <- truss$aisc$array_name_column
+  bar <- truss$Bar[["Bar Number"]]
+
+  grp <- as.character(truss$Bar$Group)
+  empty <- is.na(grp) | trimws(grp) == ""
+  grp[empty] <- paste0("solo_", bar[empty])
+  groups <- unique(grp)
+
+  delta_allow <- deflection_function(truss)$delta_allow
+
+  if (!is.null(start)) {
+    sec_grp <- start[groups]                          # given / random start
+  } else {
+    sel <- truss$selection[truss$selection$System == system, ]
+    sec_grp <- setNames(sel$Section[match(groups, sel$Group)], groups)
+  }
+  for (g in groups[is.na(sec_grp)]) {                 # fallback: heaviest allowed section
+    cols <- which(grp == g)
+    ok <- which(truss$allowed[, cols[1], system])
+    if (length(ok) == 0) stop("group ", g, " has no allowed section in ", system)
+    sec_grp[g] <- key[ok[which.max(truss$aisc$A[ok])]]
+  }
+
+  A_min        <- setNames(rep(0, length(groups)), groups)  # raised if deflection fails
+  seen         <- character(0)
+  converged    <- FALSE
+  stuck        <- FALSE
+  stuck_groups <- character(0)
+  path <- list()                                         # design at every iteration
+  tr <- NULL
+  an <- NULL
+
+  for (it in 1:max_iter) {
+
+    sec_bar <- match(sec_grp[grp], key)
+    an <- analyze_design(truss, sec_bar)
+    path[[it]] <- sec_grp
+
+    defl_ok <- an$uy_max <= delta_allow
+    if (!defl_ok)
+      A_min <- pmax(A_min, defl_bump * truss$aisc$A[match(sec_grp, key)])
+
+    tr <- evaluate_design(truss, an)
+
+    new_sec <- sec_grp
+    stuck_groups <- character(0)                      # reset every iteration
+    for (g in groups) {
+      cols <- which(grp == g)
+      ok   <- tr$feasible_group[, cols[1], system] & tr$aisc$A >= A_min[g]
+      gc   <- rowSums(tr$cost[, cols, drop = FALSE])
+      gc[!ok | is.na(gc)] <- Inf
+      best <- which.min(gc)
+      if (is.finite(gc[best])) {
+        new_sec[g] <- key[best]
+      } else {
+        stuck_groups <- c(stuck_groups, g)            # no feasible section for this group
+        if (!quiet) message("iter ", it, ": group ", g,
+                            " has no feasible section, kept current")
+      }
+    }
+    stuck <- length(stuck_groups) > 0
+
+    if (!quiet)
+      message("iter ", it, ": ", sum(new_sec != sec_grp), " groups changed, uy_max = ",
+              round(an$uy_max, 3), " (allow ", round(delta_allow, 3), ")",
+              if (stuck) paste0(", STUCK: ", paste(stuck_groups, collapse = ",")) else "")
+
+    # true convergence: nothing changes, deflection passes, no group stuck
+    if (all(new_sec == sec_grp) && defl_ok && !stuck) { converged <- TRUE; break }
+
+    # nothing can move and something is stuck: stop, this design is infeasible
+    if (all(new_sec == sec_grp) && stuck) {
+      if (!quiet) warning("stuck groups: ", paste(stuck_groups, collapse = ","),
+                          " have no feasible section, stopping")
+      break
+    }
+
+    tag <- paste(new_sec, collapse = "|")
+    if (tag %in% seen) { if (!quiet) warning("design is cycling, stopping"); break }
+    seen    <- c(seen, tag)
+    sec_grp <- new_sec
+  }
+
+  if (!converged && !quiet) warning("did not converge for ", system)
+
+  total <- sum(sapply(groups, function(g) {
+    cols <- which(grp == g)
+    sum(tr$cost[sec_grp[g], cols])
+  }))
+
+  list(system = system, section = sec_grp, converged = converged,
+       iterations = it, analysis = an, total_cost = total, path = path,
+       stuck = stuck, stuck_groups = stuck_groups)
+}
+```
+
+group_demands and verify_design
+```{r verify}
+# ---- governing demands per group from the mixed analysis ----
+group_demands <- function(truss, an, sec_grp) {
+  bar <- truss$Bar[["Bar Number"]]
+  grp <- as.character(truss$Bar$Group)
+  empty <- is.na(grp) | trimws(grp) == ""
+  grp[empty] <- paste0("solo_", bar[empty])
+
+  Nt <- pmax(round(an$N[, "LC1"], 8), round(an$N[, "LC2"], 8), 0)
+  Nc <- pmax(-round(an$N[, "LC1"], 8), -round(an$N[, "LC2"], 8), 0)
+
+  do.call(rbind, lapply(unique(grp), function(g) {
+    cols <- which(grp == g)
+    data.frame(Group = g,
+               Bars = paste(bar[cols], collapse = ","),
+               Section = unname(sec_grp[g]),
+               N_t_gov = max(Nt[cols]),
+               N_t_bar = bar[cols][which.max(Nt[cols])],
+               N_c_gov = max(Nc[cols]),
+               N_c_bar = bar[cols][which.max(Nc[cols])],
+               stringsAsFactors = FALSE)
+  }))
+}
+
+# ---- final check of a converged design ----
+verify_design <- function(truss, d) {
+  key <- truss$aisc$array_name_column
+  bar <- truss$Bar[["Bar Number"]]
+  grp <- as.character(truss$Bar$Group)
+  empty <- is.na(grp) | trimws(grp) == ""
+  grp[empty] <- paste0("solo_", bar[empty])
+
+  sec_bar <- match(d$section[grp], key)
+  an <- analyze_design(truss, sec_bar)
+  tr <- evaluate_design(truss, an)
+
+  g_bar <- sapply(seq_along(bar), function(b) tr$g_max[sec_bar[b], b, d$system])
+  delta_allow <- deflection_function(truss)$delta_allow
+
+  list(bars_ok = all(g_bar <= 0),
+       g_bar = setNames(g_bar, bar),
+       deflection_ok = an$uy_max <= delta_allow,
+       uy_max = an$uy_max,
+       groups = group_demands(truss, an, d$section))
+}
+```
+
+Size of the search space (sections allowed per group, and the product)
+```{r space}
+space_size <- function(truss, system) {
+  bar <- truss$Bar[["Bar Number"]]
+  grp <- as.character(truss$Bar$Group)
+  empty <- is.na(grp) | trimws(grp) == ""
+  grp[empty] <- paste0("solo_", bar[empty])
+  groups <- unique(grp)
+
+  n_allowed <- sapply(groups, function(g) {
+    cols <- which(grp == g)
+    sum(truss$allowed[, cols[1], system])
+  })
+  list(per_group = n_allowed, total = prod(as.numeric(n_allowed)))
+}
+```
+
+Multi-start search: run the loop from many starting designs, keep the cheapest converged one
+```{r multi_start}
+multi_start <- function(truss, system = "S1", n_starts = 30, seed = 1,
+                        defl_bump = 1.10, max_iter = 30) {
+  set.seed(seed)
+  key <- truss$aisc$array_name_column
+  bar <- truss$Bar[["Bar Number"]]
+
+  grp <- as.character(truss$Bar$Group)
+  empty <- is.na(grp) | trimws(grp) == ""
+  grp[empty] <- paste0("solo_", bar[empty])
+  groups <- unique(grp)
+
+  random_start <- function() {
+    setNames(sapply(groups, function(g) {
+      cols <- which(grp == g)
+      ok <- which(truss$allowed[, cols[1], system])
+      key[ok[sample.int(length(ok), 1)]]
+    }), groups)
+  }
+
+  # start 1 = the uniform-pipeline start (NULL), the rest are random
+  starts  <- c(list(NULL), replicate(n_starts - 1, random_start(), simplify = FALSE))
+  results <- lapply(seq_along(starts), function(k) {
+    message("system ", system, ": start ", k, " of ", n_starts)
+    tryCatch(suppressWarnings(design_loop(truss, system, start = starts[[k]],
+                                          max_iter = max_iter, defl_bump = defl_bump,
+                                          quiet = TRUE)),
+             error = function(e) NULL)
+  })
+
+  tab <- data.frame(
+    start      = seq_along(results),
+    converged  = sapply(results, function(r) !is.null(r) && r$converged),
+    total_cost = sapply(results, function(r) if (is.null(r)) NA_real_ else r$total_cost),
+    iterations = sapply(results, function(r) if (is.null(r)) NA_integer_ else r$iterations),
+    design     = sapply(results, function(r)
+                   if (is.null(r)) NA_character_ else paste(r$section, collapse = "|")),
+    stringsAsFactors = FALSE)
+
+  good <- which(tab$converged)
+  if (length(good) == 0) stop("no start converged for ", system)
+  best <- good[which.min(tab$total_cost[good])]
+
+  # distinct converged designs, cheapest first, with how many starts reached each
+  distinct <- aggregate(start ~ design + total_cost, data = tab[good, ], FUN = length)
+  names(distinct)[3] <- "times_found"
+  distinct <- distinct[order(distinct$total_cost), ]
+
+  list(best = results[[best]], table = tab, distinct = distinct, results = results)
+}
+```
+
+Run: first check the size of the search space, then the multi-start for every system
+```{r run_loop}
+sys <- dimnames(truss$allowed)[[3]]
+
+# size of the search space per system
+lapply(sys, function(s) space_size(truss, s))
+
+# try n_starts <- 5 first to time it, then raise it
+n_starts  <- 100
+defl_bump <- 1.10     # deflection bump: areas raised by this factor when the sag is too big
+max_iter  <- 50
+
+# multi_start stops with an error if no start converges, so catch it per system
+ms <- lapply(sys, function(s)
+  tryCatch(multi_start(truss, s, n_starts = n_starts,
+                       defl_bump = defl_bump, max_iter = max_iter),
+           error = function(e) { message(s, ": ", conditionMessage(e)); NULL }))
+names(ms) <- sys
+
+ran <- !sapply(ms, is.null)
+
+# best design per system (only systems where something converged)
+sapply(ms[ran], function(m) m$best$total_cost)
+
+# verify the winners from scratch (every bar + deflection)
+checks <- lapply(ms[ran], function(m) verify_design(truss, m$best))
+sapply(checks, function(x) x$bars_ok && x$deflection_ok)
+```
+
+Diagnostics: are the "converged" starts really feasible, and which groups get stuck
+```{r diagnostics}
+# how many starts are now really converged, and how long did they take
+table(ms$S1$table$converged)
+table(ms$S1$table$iterations)
+
+# every start marked converged should pass the full verification (expect all TRUE)
+ok <- sapply(ms$S1$results, function(r) {
+  if (is.null(r) || !r$converged) return(NA)
+  v <- verify_design(truss, list(system = "S1", section = r$section))
+  v$bars_ok && v$deflection_ok
+})
+table(ok, useNA = "ifany")
+
+# which groups get stuck, across all starts
+stuck_tab <- table(unlist(lapply(ms$S1$results, function(r) if (!is.null(r)) r$stuck_groups)))
+stuck_tab
+
+# watch one start step by step
+d2 <- design_loop(truss, "S1", start = ms$S1$results[[2]]$path[[1]], quiet = FALSE)
+d2$stuck_groups
+```
+
+Look at the results
+```{r results}
+ms$S1$table                 # one row per start: converged, cost, iterations, final design
+ms$S1$distinct              # distinct designs found, cheapest first, times_found = how many starts reached it
+ms$S1$best$section          # best design: section per group
+checks$S1$groups            # governing demands and section per group for the best design
+
+# path of start k: every design that start visited (one list element per iteration)
+k <- 1
+ms$S1$results[[k]]$path
+```
+
+
+
+
+
+
+```{r}
+
+show_starts <- function(m, initial = FALSE) {
+  groups <- names(m$best$section)
+
+  pick <- function(r) {
+    if (is.null(r)) return(rep(NA_character_, length(groups)))   # crashed start
+    v <- if (initial) r$path[[1]] else r$section                 # first or final design
+    unname(v[groups])
+  }
+
+  mat <- t(sapply(m$results, pick))
+  colnames(mat) <- groups
+
+  data.frame(
+    start      = seq_along(m$results),
+    converged  = m$table$converged,
+    total_cost = m$table$total_cost,
+    mat,
+    check.names = FALSE,
+    stringsAsFactors = FALSE
+  )
+}
+
+final_S1   <- show_starts(ms$S1)                    # where each start ended up
+initial_S1 <- show_starts(ms$S1, initial = TRUE)    # where each start began
+
+final_S1
+initial_S1
+
+```
+```{r}
+stat_mode <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA_character_)
+  names(which.max(table(x)))
+}
+
+final_S1 <- show_starts(ms$S1)
+groups   <- setdiff(names(final_S1), c("start", "converged", "total_cost"))   # G1..G4
+conv     <- final_S1[final_S1$converged %in% TRUE, ]                          # converged starts only
+
+# ---- A) mode design: the most common full row ----
+conv$design   <- apply(conv[, groups], 1, paste, collapse = " | ")
+counts        <- sort(table(conv$design), decreasing = TRUE)
+
+design_table <- data.frame(
+  design      = names(counts),
+  times_found = as.vector(counts),
+  share       = round(as.vector(counts) / nrow(conv), 2),
+  total_cost  = conv$total_cost[match(names(counts), conv$design)],
+  stringsAsFactors = FALSE
+)
+design_table                                   # every distinct design, most common first
+
+mode_design <- unlist(conv[match(design_table$design[1], conv$design), groups])
+mode_design                                    # the mode design, one section per group
+
+# ---- B) mode of each group (each column separately) ----
+mode_by_group <- data.frame(
+  Group        = groups,
+  mode_section = sapply(groups, function(g) stat_mode(conv[[g]])),
+  share        = sapply(groups, function(g) round(mean(conv[[g]] == stat_mode(conv[[g]])), 2)),
+  row.names    = NULL
+)
+mode_by_group
+
+```
